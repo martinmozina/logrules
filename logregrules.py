@@ -3,6 +3,17 @@ import Orange
 import numpy as np
 from orngABML import *
 
+class RuleToAtt:
+    """ Coverting Orange rule to an attribute """
+    def __init__(self, attribute, rule, positive_value):
+        self.attribute = attribute
+        self.rule = rule
+        self.positive_value = positive_value
+
+    def __call__(self, example, returnType):
+        if self.rule(example):
+            return Orange.data.Value(self.attribute, self.positive_value)
+        return Orange.data.Value(self.attribute, 0)
 
 class LogRegFitter:
     """ Class learns a logistic regression model with L2 penalty. It uses gradient descent. An attribute can be a normal
@@ -10,7 +21,7 @@ class LogRegFitter:
     derivatives.
     """
 
-    def __init__(self, attributes, data, C, eps, weps, alpha):
+    def __init__(self, data, original_data, rules, C, eps, weps, alpha):
         """
         Init accepts n vectors (corresponding to attributes) with rules attached to each attribute. IF rule is None,
         then attributes is just a normal attribute, otherwise conside difference between rule quality and
@@ -18,17 +29,46 @@ class LogRegFitter:
 
         C value and eps and alpha are parameters guiding optimization
         """
-        self.attributes = attributes
         self.data = data
+        self.original_data = original_data
+        self.rules = rules # 
         self.C = C
         self.eps = eps
         self.weps = weps
         self.alpha = alpha
-
+        
+        self.add_rules()
         self.initialize_values()
         self.learn_model()
 
+    def add_rules(self):
+        # add rules
+        # compute penalties
+        self.penalty = [np.array([1] * len(self.data)) for a in self.data.domain.attributes]
+        self.rule_classes = [-1] * len(self.data.domain.attributes)
+        new_attributes = [a for a in self.data.domain.attributes]
+        if not self.rules:
+            return
+        for r in self.rules:
+            newAttr = Orange.feature.Continuous(Orange.classification.rules.rule_to_string(r))
+            newAttr.getValueFrom = RuleToAtt(newAttr, r, 1)
+            new_attributes.append(newAttr)
+            rf = r.classDistribution[int(r.classifier.defaultVal)] / r.classDistribution.abs
+            penalty = r.quality / rf
+            penalArray = [penalty if r(e) else 1 for e in self.original_data]
+            self.penalty.append(np.array(penalArray))
+            self.rule_classes.append(int(r.classifier.defaultVal))
+        new_domain = Orange.data.Domain(new_attributes, self.data.domain.classVar)
+        new_domain.add_metas(self.data.domain.get_metas())
+        self.data = Orange.data.Table(new_domain, self.original_data)
+
     def initialize_values(self):
+        # impute missing values with 0
+        for ci in self.data:
+            for at in self.data.domain.attributes:
+                if ci[at].isSpecial():
+                    ci[at] = 0
+
         self.x, self.ya = self.data.toNumpy("1a/c")
         if len(data.domain.classVar.values) == 2:
             self.y = [self.ya]
@@ -41,12 +81,15 @@ class LogRegFitter:
                 tmp[tmp==-1] = 1
                 self.y.append(tmp)
         self.xy = [self.x * y[:, np.newaxis] for y in self.y]
-        self.weights = [np.zeros(len(self.attributes)+1) for y in self.y]
+        self.penalty = [1] + self.penalty
+        self.xydiff = [self.x * (1.0 - penal[:, np.newaxis] for penal in self.penalty] 
+        self.rule_classes = [-1] + self.rule_classes
+        self.weights = [np.zeros(len(self.data.domain.attributes)+1) for y in self.y]
         self.z = [0] * len(self.weights)
         self.h = [0] * len(self.weights)
         self.minvals = np.array([-20] * len(self.data))
         self.maxvals = np.array([20] * len(self.data))
-
+        #print self.penalty
 
     def err(self, i):
         error = np.dot(self.weights[i], self.weights[i])
@@ -59,6 +102,10 @@ class LogRegFitter:
         return error
 
     def deriv(self, i):
+        # ideally this product (xy * penalty) would be a product of vectors
+        # 
+        #
+
         return self.weights[i] + self.C * np.sum(self.x * self.h[i][:,np.newaxis] - 
                                                  self.xy[i] * self.penalty[i], axis=0)
 
@@ -82,6 +129,7 @@ class LogRegFitter:
                 old_diff = diff
                 diff = np.linalg.norm(old_weights - self.weights[i])
                 old_error, new_error = new_error, self.err(i)
+        print self.weights
 
     def __call__(self, example):
         example = Orange.data.Instance(self.data.domain, example)
@@ -126,15 +174,13 @@ class LogRegRules(Orange.classification.Learner):
         continuizer.class_treatment = continuizer.LeaveUnlessTarget
         cont_domain = continuizer(instances)
         cont_instances = Orange.data.Table(cont_domain, instances)
-        # impute missing values with 0
-        for ci in cont_instances:
-            for at in cont_domain.attributes:
-                if ci[at].isSpecial():
-                    ci[at] = 0
-        attributes = [(a, None) for a in cont_instances.domain.attributes]
-    
+        
+        if self.use_rules:
+            rules = self.rule_learner(instances).rules
+            fitter = LogRegFitter(cont_instances, instances, rules, 1.0, 0.001, 0.001, 0.01)
+        else:
+            fitter = LogRegFitter(cont_instances, instances, None, 1.0, 0.001, 0.001, 0.01)
 
-        fitter = LogRegFitter(attributes, cont_instances, 1.0, 0.001, 0.001, 0.01)
 
         return LogRegRulesClassifier(fitter, None)
 
@@ -243,11 +289,11 @@ class LogRegRulesClassifier(Orange.classification.Classifier):
 datasets = [
 "abalone",
 "ailerons",
-"adult",
-"anneal",
-"audiology",
-"auto-mpg",
-"balance-scale",
+#"adult",
+#"anneal",
+#"audiology",
+#"auto-mpg",
+#"balance-scale",
 "breast-cancer",
 "breast-cancer-wisconsin-cont",
 "bupa",
@@ -311,12 +357,12 @@ if __name__ == '__main__':
         print " *** " * 10
         print ds
         data = Orange.data.Table("./domene/%s/%s.tab"%(ds,ds))
-        #if len(data.domain.classVar.values) > 2:
-        #    print "Leaving this data set as it has more than 2 classes."
-        #    continue
-        #if len(data) > 1000 or len(data.domain.attributes) > 1000:
-        #    print "Leaving this data set as it is too large."
-        #    continue
+        if len(data.domain.classVar.values) > 2:
+            print "Leaving this data set as it has more than 2 classes."
+            continue
+        if len(data) > 1000 or len(data.domain.attributes) > 1000:
+            print "Leaving this data set as it is too large."
+            continue
         print "dataset=%s, datalen=%d, n_classes=%d"%(ds, len(data), len(data.domain.classVar.values))
 
         cv = Orange.evaluation.testing.cross_validation(learners, data, folds=10)
